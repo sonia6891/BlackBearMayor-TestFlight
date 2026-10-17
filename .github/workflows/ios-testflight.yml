@@ -78,6 +78,23 @@ jobs:
           PY
           python3 -m venv "$RUNNER_TEMP/asc-venv"
           "$RUNNER_TEMP/asc-venv/bin/pip" install --quiet cryptography
+      # Prints only yes/no and lengths (these logs are public), to tell which pasted secret is wrong after an HTTP 401.
+      - name: Check the format of the key secrets
+        run: |
+          "$RUNNER_TEMP/asc-venv/bin/python" - <<'PY'
+          import os, re, pathlib
+          from cryptography.hazmat.primitives import serialization
+          from cryptography.hazmat.primitives.asymmetric import ec
+          kid, iss = os.environ["ASC_KEY_ID"], os.environ["ASC_ISSUER_ID"]
+          print("Key ID: 10 uppercase letters/digits:", bool(re.fullmatch(r"[A-Z0-9]{10}", kid)), "| length", len(kid))
+          uuid = bool(re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", iss.lower()))
+          print("Issuer ID: UUID 8-4-4-4-12:", uuid, "| length", len(iss), "| spaces", iss != iss.strip(), "| looks like a Team/Key ID", bool(re.fullmatch(r"[A-Z0-9]{10}", iss.strip())))
+          try:
+              key = serialization.load_pem_private_key((pathlib.Path(os.environ["RUNNER_TEMP"]) / "asc-signing" / "AuthKey.p8").read_bytes(), password=None)
+              print(".p8: valid P-256 private key:", isinstance(key, ec.EllipticCurvePrivateKey) and key.curve.name == "secp256r1")
+          except Exception as error:
+              print(".p8: not a valid private key:", type(error).__name__)
+          PY
       - name: Register the Bundle ID and check the app record
         run: '"$RUNNER_TEMP/asc-venv/bin/python" Scripts/asc_app.py register BlackBearMayor'
       - name: Remove the key
