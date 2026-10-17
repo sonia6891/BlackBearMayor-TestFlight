@@ -41,6 +41,22 @@ def register(name: str) -> None:
         print(f"::warning::App Store Connect 還沒有 Bundle ID 為 {bundle} 的 App 紀錄：請到 App Store Connect 新增 App 並選這個 Bundle ID，再執行上傳。")
 
 
+def status() -> None:
+    """Lists the app's latest builds and its TestFlight groups with tester and build counts (counts only: logs are public)."""
+    app = app_id()
+    for build in call("GET", f"builds?filter[app]={app}&sort=-uploadedDate&limit=5")["data"]:
+        a = build["attributes"]
+        print(f"Build {a['version']}: processing {a['processingState']}, expired {a.get('expired')}, uploaded {a.get('uploadedDate')}")
+    groups = call("GET", f"betaGroups?filter[app]={app}&limit=50")["data"]
+    if not groups:
+        print("TestFlight groups: none")
+    for group in groups:
+        g = group["attributes"]
+        testers = call("GET", f"betaGroups/{group['id']}/betaTesters?limit=200")["data"]
+        builds = call("GET", f"betaGroups/{group['id']}/builds?limit=50")["data"]
+        print(f"Group: internal {g.get('isInternalGroup')}, all builds {g.get('hasAccessToAllBuilds')}, testers {len(testers)}, builds {len(builds)}")
+
+
 def rename(name: str) -> None:
     app = app_id()
     changed = 0
@@ -96,7 +112,9 @@ def testflight(version: str = "") -> None:
 
 if __name__ == "__main__":
     try:
-        if sys.argv[1] == "register":
+        if sys.argv[1] == "status":
+            status()
+        elif sys.argv[1] == "register":
             register(sys.argv[2] if len(sys.argv) > 2 else "BlackBearMayor")
         elif sys.argv[1] == "rename":
             rename(sys.argv[2])

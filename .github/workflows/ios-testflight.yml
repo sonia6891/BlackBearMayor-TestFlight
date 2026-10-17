@@ -11,9 +11,9 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: register = 註冊 Bundle ID 並檢查 App 紀錄；upload = 上傳 TestFlight
+        description: register = 註冊 Bundle ID 並檢查 App 紀錄；upload = 上傳 TestFlight；status = 查看組建與測試群組
         type: choice
-        options: [upload, register]
+        options: [upload, register, status]
         default: upload
       tag:
         description: GitHub release that holds BlackBearMayor-Xcode.tar.gz.enc (upload only)
@@ -52,7 +52,7 @@ jobs:
 
   register:
     needs: prerequisites
-    if: inputs.action == 'register'
+    if: inputs.action == 'register' || inputs.action == 'status'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -96,7 +96,11 @@ jobs:
               print(".p8: not a valid private key:", type(error).__name__)
           PY
       - name: Register the Bundle ID and check the app record
+        if: inputs.action == 'register'
         run: '"$RUNNER_TEMP/asc-venv/bin/python" Scripts/asc_app.py register BlackBearMayor'
+      - name: Show builds and TestFlight groups
+        if: inputs.action == 'status'
+        run: '"$RUNNER_TEMP/asc-venv/bin/python" Scripts/asc_app.py status'
       - name: Remove the key
         if: always()
         run: rm -rf "$RUNNER_TEMP/asc-signing"
