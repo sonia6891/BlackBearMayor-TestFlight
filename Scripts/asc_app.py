@@ -46,7 +46,13 @@ def status() -> None:
     app = app_id()
     for build in call("GET", f"builds?filter[app]={app}&sort=-uploadedDate&limit=5")["data"]:
         a = build["attributes"]
-        print(f"Build {a['version']}: processing {a['processingState']}, expired {a.get('expired')}, uploaded {a.get('uploadedDate')}")
+        print(f"Build {a['version']}: processing {a['processingState']}, expired {a.get('expired')}, uploaded {a.get('uploadedDate')}, "
+              f"min iOS {a.get('minOsVersion')}, encryption declared {a.get('usesNonExemptEncryption')}")
+        try:
+            beta = call("GET", f"builds/{build['id']}/buildBetaDetail")["data"]["attributes"]
+            print(f"  TestFlight: internal {beta.get('internalBuildState')}, external {beta.get('externalBuildState')}, auto-notify {beta.get('autoNotifyEnabled')}")
+        except ApiError as error:
+            print(f"  TestFlight state unavailable: {error}")
     groups = call("GET", f"betaGroups?filter[app]={app}&limit=50")["data"]
     if not groups:
         print("TestFlight groups: none")
@@ -55,6 +61,10 @@ def status() -> None:
         testers = call("GET", f"betaGroups/{group['id']}/betaTesters?limit=200")["data"]
         builds = call("GET", f"betaGroups/{group['id']}/builds?limit=50")["data"]
         print(f"Group: internal {g.get('isInternalGroup')}, all builds {g.get('hasAccessToAllBuilds')}, testers {len(testers)}, builds {len(builds)}")
+        # Invitation state only, never names or e-mail addresses: these logs are public.
+        for tester in testers:
+            t = tester["attributes"]
+            print(f"  Tester: invite {t.get('inviteType')}, state {t.get('state')}")
 
 
 def rename(name: str) -> None:
