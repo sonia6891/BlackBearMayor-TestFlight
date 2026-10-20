@@ -22,3 +22,8 @@
 | `BUILD_PASSPHRASE` | 加密 Xcode 專案用的密碼，必須和本機密碼檔相同 |
 
 Bundle ID：`tw.blackbearmayor.game`。Workflow 的 `action=register` 會註冊 Bundle ID，並檢查 App Store Connect 的 App 紀錄。
+
+## 九命夢境
+
+同一套流程也上傳《九命夢境》：`.github/workflows/ninelives-testflight.yml`，共用上面四個 Secrets（同一個 Apple 開發者團隊和 API 金鑰、同一個加密密碼）。
+遊戲端是九命夢境專案的 `Tools/Publish-TestFlight.ps1`，release 的標籤是 `nld-ios-<build>`。Bundle ID：`tw.ninelivesdream.game`。

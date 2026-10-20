@@ -1,0 +1,241 @@
+name: 九命夢境 iOS TestFlight
+# Upload pipeline for 九命夢境 (Nine Lives Dream), next to 黑熊市長's ios-testflight.yml and sharing its secrets: the
+# same Apple developer team and App Store Connect API key (APPLE_ASC_KEY_ID, APPLE_ASC_ISSUER_ID, APPLE_ASC_KEY_P8) and
+# the same BUILD_PASSPHRASE. The game's own Tools/Publish-TestFlight.ps1 exports the Xcode project with Unity on Windows,
+# encrypts it and attaches it to a release here (tag nld-ios-<build>), so the public release holds only ciphertext.
+# Each run creates a temporary distribution certificate and App Store profile and removes both at the end. Nothing
+# secret is printed; these logs are public.
+#   action=register  registers the Bundle ID and reports whether the App Store Connect app record exists (1 minute)
+#   action=upload    archives the Xcode project from release <tag>, uploads it and gives it to internal testers
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: register = 註冊 Bundle ID 並檢查 App 紀錄；upload = 上傳 TestFlight；status = 查看組建與測試群組
+        type: choice
+        options: [upload, register, status]
+        default: upload
+      tag:
+        description: GitHub release that holds NineLivesDream-Xcode.tar.gz.enc (upload only)
+        required: false
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: ninelivesdream-testflight
+  cancel-in-progress: false
+env:
+  APP_BUNDLE_ID: tw.ninelivesdream.game
+jobs:
+  prerequisites:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the App Store Connect API key
+        env:
+          APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+          APPLE_ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+          APPLE_ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+          BUILD_PASSPHRASE: ${{ secrets.BUILD_PASSPHRASE }}
+          ACTION: ${{ inputs.action }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          missing=0
+          required="APPLE_ASC_KEY_ID APPLE_ASC_ISSUER_ID APPLE_ASC_KEY_P8"
+          # Only an upload decrypts a release; register works with the Apple key alone.
+          if [[ "$ACTION" == upload ]]; then required="$required BUILD_PASSPHRASE"; fi
+          for name in $required; do
+            if [[ -z "${!name}" ]]; then echo "::error::Missing secret $name (Settings > Secrets and variables > Actions)"; missing=1; fi
+          done
+          if [[ "$ACTION" == upload && -z "$TAG" ]]; then echo "::error::upload needs the release tag"; missing=1; fi
+          [[ "$missing" == 0 ]]
+
+  register:
+    needs: prerequisites
+    if: inputs.action == 'register' || inputs.action == 'status'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: Scripts
+      - name: Prepare the API key
+        env:
+          ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+        run: &write-key |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/asc-signing"
+          # The pasted key with or without its BEGIN/END lines.
+          python3 - <<'PY'
+          import os, pathlib, re
+          body = re.sub(r"-----[A-Z ]+-----|\s", "", os.environ["ASC_KEY_P8"].strip())
+          pem = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(body[i:i + 64] for i in range(0, len(body), 64)) + "\n-----END PRIVATE KEY-----\n"
+          (pathlib.Path(os.environ["RUNNER_TEMP"]) / "asc-signing" / "AuthKey.p8").write_text(pem)
+          PY
+          python3 -m venv "$RUNNER_TEMP/asc-venv"
+          "$RUNNER_TEMP/asc-venv/bin/pip" install --quiet cryptography
+      # Prints only yes/no and lengths (these logs are public), to tell which pasted secret is wrong after an HTTP 401.
+      - name: Check the format of the key secrets
+        run: |
+          "$RUNNER_TEMP/asc-venv/bin/python" - <<'PY'
+          import os, re, pathlib
+          from cryptography.hazmat.primitives import serialization
+          from cryptography.hazmat.primitives.asymmetric import ec
+          kid, iss = os.environ["ASC_KEY_ID"], os.environ["ASC_ISSUER_ID"]
+          print("Key ID: 10 uppercase letters/digits:", bool(re.fullmatch(r"[A-Z0-9]{10}", kid)), "| length", len(kid))
+          uuid = bool(re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", iss.lower()))
+          print("Issuer ID: UUID 8-4-4-4-12:", uuid, "| length", len(iss), "| spaces", iss != iss.strip(), "| looks like a Team/Key ID", bool(re.fullmatch(r"[A-Z0-9]{10}", iss.strip())))
+          try:
+              key = serialization.load_pem_private_key((pathlib.Path(os.environ["RUNNER_TEMP"]) / "asc-signing" / "AuthKey.p8").read_bytes(), password=None)
+              print(".p8: valid P-256 private key:", isinstance(key, ec.EllipticCurvePrivateKey) and key.curve.name == "secp256r1")
+          except Exception as error:
+              print(".p8: not a valid private key:", type(error).__name__)
+          PY
+      - name: Register the Bundle ID and check the app record
+        if: inputs.action == 'register'
+        run: '"$RUNNER_TEMP/asc-venv/bin/python" Scripts/asc_app.py register NineLivesDream'
+      - name: Show builds and TestFlight groups
+        if: inputs.action == 'status'
+        run: '"$RUNNER_TEMP/asc-venv/bin/python" Scripts/asc_app.py status'
+      - name: Remove the key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc-signing"
+
+  upload:
+    needs: prerequisites
+    if: inputs.action == 'upload'
+    runs-on: macos-26
+    timeout-minutes: 90
+    outputs:
+      build: ${{ steps.archive.outputs.build }}
+    env:
+      ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+      APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+      APPLE_ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: Scripts
+      - name: Download and decrypt the Unity Xcode project
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          BUILD_PASSPHRASE: ${{ secrets.BUILD_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "NineLivesDream-Xcode.tar.gz.enc" -D "$RUNNER_TEMP"
+          # OpenSSL 3 on both ends (Git for Windows encrypts, Homebrew's openssl@3 decrypts; macOS's own is LibreSSL).
+          OPENSSL="$(brew --prefix openssl@3 2>/dev/null)/bin/openssl"
+          [[ -x "$OPENSSL" ]] || { brew install openssl@3 >/dev/null; OPENSSL="$(brew --prefix openssl@3)/bin/openssl"; }
+          "$OPENSSL" enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:BUILD_PASSPHRASE \
+            -in "$RUNNER_TEMP/NineLivesDream-Xcode.tar.gz.enc" -out "$RUNNER_TEMP/NineLivesDream-Xcode.tar.gz" \
+            || { echo "::error::Decryption failed: BUILD_PASSPHRASE does not match the one used to encrypt this release"; exit 1; }
+          rm "$RUNNER_TEMP/NineLivesDream-Xcode.tar.gz.enc"
+          mkdir -p "$RUNNER_TEMP/xcode"
+          tar -xzf "$RUNNER_TEMP/NineLivesDream-Xcode.tar.gz" -C "$RUNNER_TEMP/xcode"
+          rm "$RUNNER_TEMP/NineLivesDream-Xcode.tar.gz"
+          cd "$RUNNER_TEMP/xcode"
+          # Exported on Windows, so the run scripts and the IL2CPP macOS tools lost their executable bit.
+          find . -name "*.sh" -exec chmod +x {} +
+          find Il2CppOutputProject/IL2CPP -type f -exec chmod +x {} +
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" Info.plist
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+      - name: Create temporary signing with the API key
+        env:
+          ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+        run: *write-key
+      - name: Create the certificate and profile
+        run: '"$RUNNER_TEMP/asc-venv/bin/python" Scripts/asc_signing.py prepare'
+      - name: Install the temporary certificate
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/asc-signing/build.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 24)
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/asc-signing/certificate.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN"
+          security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "Apple Distribution" || { echo "::error::The temporary certificate did not install"; exit 1; }
+      - name: Archive the signed app
+        id: archive
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/build"
+          cd "$RUNNER_TEMP/xcode"
+          # Unity's app target reads its profile from PROVISIONING_PROFILE_SPECIFIER_APP; UnityFramework needs none.
+          # The IL2CPP build is very chatty, so the full output goes to archive.log (kept as an artifact).
+          LOG="$RUNNER_TEMP/build/archive.log"
+          set +e
+          xcodebuild archive -project Unity-iPhone.xcodeproj -scheme Unity-iPhone -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/build/NineLivesDream.xcarchive" \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY='Apple Distribution' DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            PROVISIONING_PROFILE_SPECIFIER_APP="$PROFILE_NAME" > "$LOG" 2>&1
+          status=$?
+          set -e
+          grep -E "error:|ARCHIVE (SUCCEEDED|FAILED)" "$LOG" | tail -40 || true
+          if [[ $status -ne 0 ]]; then tail -120 "$LOG"; exit 1; fi
+          APP="$RUNNER_TEMP/build/NineLivesDream.xcarchive/Products/Applications/$(ls "$RUNNER_TEMP/build/NineLivesDream.xcarchive/Products/Applications")"
+          python3 - "$APP/Info.plist" <<'PY'
+          import os, plistlib, sys
+          p = plistlib.load(open(sys.argv[1], "rb"))
+          assert p["CFBundleIdentifier"] == os.environ["APP_BUNDLE_ID"], p["CFBundleIdentifier"]
+          print("Verified", p["CFBundleIdentifier"], p["CFBundleDisplayName"], p["CFBundleShortVersionString"], p["CFBundleVersion"])
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"build={p['CFBundleVersion']}\n")
+          PY
+      - name: Upload to App Store Connect
+        run: |
+          set -euo pipefail
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/build/NineLivesDream.xcarchive" \
+            -exportPath "$RUNNER_TEMP/build/export" -exportOptionsPlist "$RUNNER_TEMP/asc-signing/ExportOptions.plist" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc-signing/AuthKey.p8" \
+            -authenticationKeyID "$APPLE_ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$APPLE_ASC_ISSUER_ID" 2>&1 | tee "$RUNNER_TEMP/build/upload.log"
+          echo "Uploaded build ${{ steps.archive.outputs.build }}. TestFlight processing still needs to finish." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: NineLivesDream-ios-logs
+          path: ${{ runner.temp }}/build/*.log
+          retention-days: 14
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/asc-signing/build.keychain-db" || true
+          if [[ -n "${PROFILE_UUID:-}" ]]; then rm -f "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/$PROFILE_UUID.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"; fi
+          if [[ -x "$RUNNER_TEMP/asc-venv/bin/python" && -f "$RUNNER_TEMP/asc-signing/AuthKey.p8" ]]; then "$RUNNER_TEMP/asc-venv/bin/python" Scripts/asc_signing.py cleanup || true; fi
+          rm -rf "$RUNNER_TEMP/asc-signing"
+
+  # Waits for the upload to finish processing and gives it to every internal TestFlight group.
+  testflight:
+    needs: upload
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: Scripts
+      - name: Prepare the API key
+        env:
+          ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+        run: *write-key
+      - name: Wait for the build and give it to internal testers
+        run: '"$RUNNER_TEMP/asc-venv/bin/python" Scripts/asc_app.py testflight "${{ needs.upload.outputs.build }}"'
+      - name: Remove the key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc-signing"
