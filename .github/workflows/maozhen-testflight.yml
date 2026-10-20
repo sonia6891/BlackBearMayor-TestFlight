@@ -1,0 +1,219 @@
+name: 貓鎮 iOS TestFlight
+# Upload pipeline for 貓鎮 (Cat Town), next to 黑熊市長's ios-testflight.yml and 九命夢境's ninelives-testflight.yml,
+# sharing their secrets: the same Apple developer team and App Store Connect API key (APPLE_ASC_KEY_ID,
+# APPLE_ASC_ISSUER_ID, APPLE_ASC_KEY_P8) and the same BUILD_PASSPHRASE. The game's ios/Tools/Publish-TestFlight.ps1
+# builds the web game on Windows, wraps it in a small xcodegen project (a full-screen WKWebView), encrypts it and
+# attaches it to a release here (tag mz-ios-<build>), so the public release holds only ciphertext. Each run creates a
+# temporary distribution certificate and App Store profile and removes both at the end. Nothing secret is printed.
+#   action=register  registers the Bundle ID and reports whether the App Store Connect app record exists (1 minute)
+#   action=upload    generates and archives the Xcode project from release <tag>, uploads it, gives it to testers
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: register = 註冊 Bundle ID 並檢查 App 紀錄；upload = 上傳 TestFlight；status = 查看組建與測試群組
+        type: choice
+        options: [upload, register, status]
+        default: upload
+      tag:
+        description: GitHub release that holds MaoZhen-Xcode.tar.gz.enc (upload only)
+        required: false
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: maozhen-testflight
+  cancel-in-progress: false
+env:
+  APP_BUNDLE_ID: tw.maozhen.game
+jobs:
+  prerequisites:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the App Store Connect API key
+        env:
+          APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+          APPLE_ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+          APPLE_ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+          BUILD_PASSPHRASE: ${{ secrets.BUILD_PASSPHRASE }}
+          ACTION: ${{ inputs.action }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          missing=0
+          required="APPLE_ASC_KEY_ID APPLE_ASC_ISSUER_ID APPLE_ASC_KEY_P8"
+          if [[ "$ACTION" == upload ]]; then required="$required BUILD_PASSPHRASE"; fi
+          for name in $required; do
+            if [[ -z "${!name}" ]]; then echo "::error::Missing secret $name (Settings > Secrets and variables > Actions)"; missing=1; fi
+          done
+          if [[ "$ACTION" == upload && -z "$TAG" ]]; then echo "::error::upload needs the release tag"; missing=1; fi
+          [[ "$missing" == 0 ]]
+
+  register:
+    needs: prerequisites
+    if: inputs.action == 'register' || inputs.action == 'status'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: Scripts
+      - name: Prepare the API key
+        env:
+          ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+        run: &write-key |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/asc-signing"
+          python3 - <<'PY'
+          import os, pathlib, re
+          body = re.sub(r"-----[A-Z ]+-----|\s", "", os.environ["ASC_KEY_P8"].strip())
+          pem = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(body[i:i + 64] for i in range(0, len(body), 64)) + "\n-----END PRIVATE KEY-----\n"
+          (pathlib.Path(os.environ["RUNNER_TEMP"]) / "asc-signing" / "AuthKey.p8").write_text(pem)
+          PY
+          python3 -m venv "$RUNNER_TEMP/asc-venv"
+          "$RUNNER_TEMP/asc-venv/bin/pip" install --quiet cryptography
+      - name: Register the Bundle ID and check the app record
+        if: inputs.action == 'register'
+        run: '"$RUNNER_TEMP/asc-venv/bin/python" Scripts/asc_app.py register MaoZhen'
+      - name: Show builds and TestFlight groups
+        if: inputs.action == 'status'
+        run: '"$RUNNER_TEMP/asc-venv/bin/python" Scripts/asc_app.py status'
+      - name: Remove the key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc-signing"
+
+  upload:
+    needs: prerequisites
+    if: inputs.action == 'upload'
+    runs-on: macos-26
+    timeout-minutes: 60
+    outputs:
+      build: ${{ steps.archive.outputs.build }}
+    env:
+      ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+      APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+      APPLE_ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: Scripts
+      - name: Download and decrypt the Xcode project
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          BUILD_PASSPHRASE: ${{ secrets.BUILD_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "MaoZhen-Xcode.tar.gz.enc" -D "$RUNNER_TEMP"
+          OPENSSL="$(brew --prefix openssl@3 2>/dev/null)/bin/openssl"
+          [[ -x "$OPENSSL" ]] || { brew install openssl@3 >/dev/null; OPENSSL="$(brew --prefix openssl@3)/bin/openssl"; }
+          "$OPENSSL" enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:BUILD_PASSPHRASE \
+            -in "$RUNNER_TEMP/MaoZhen-Xcode.tar.gz.enc" -out "$RUNNER_TEMP/MaoZhen-Xcode.tar.gz" \
+            || { echo "::error::Decryption failed: BUILD_PASSPHRASE does not match the one used to encrypt this release"; exit 1; }
+          rm "$RUNNER_TEMP/MaoZhen-Xcode.tar.gz.enc"
+          mkdir -p "$RUNNER_TEMP/xcode"
+          tar -xzf "$RUNNER_TEMP/MaoZhen-Xcode.tar.gz" -C "$RUNNER_TEMP/xcode"
+          rm "$RUNNER_TEMP/MaoZhen-Xcode.tar.gz"
+          ls "$RUNNER_TEMP/xcode"
+      - name: Select Xcode and generate the project
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          brew install xcodegen >/dev/null
+          cd "$RUNNER_TEMP/xcode"
+          xcodegen generate
+      - name: Create temporary signing with the API key
+        env:
+          ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+        run: *write-key
+      - name: Create the certificate and profile
+        run: '"$RUNNER_TEMP/asc-venv/bin/python" Scripts/asc_signing.py prepare'
+      - name: Install the temporary certificate
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/asc-signing/build.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 24)
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/asc-signing/certificate.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN"
+          security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "Apple Distribution" || { echo "::error::The temporary certificate did not install"; exit 1; }
+      - name: Archive the signed app
+        id: archive
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/build"
+          cd "$RUNNER_TEMP/xcode"
+          LOG="$RUNNER_TEMP/build/archive.log"
+          set +e
+          xcodebuild archive -project MaoZhen.xcodeproj -scheme MaoZhen -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/build/MaoZhen.xcarchive" \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY='Apple Distribution' DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" > "$LOG" 2>&1
+          status=$?
+          set -e
+          grep -E "error:|ARCHIVE (SUCCEEDED|FAILED)" "$LOG" | tail -40 || true
+          if [[ $status -ne 0 ]]; then tail -120 "$LOG"; exit 1; fi
+          APP="$RUNNER_TEMP/build/MaoZhen.xcarchive/Products/Applications/$(ls "$RUNNER_TEMP/build/MaoZhen.xcarchive/Products/Applications")"
+          ls "$APP/Web" | head
+          python3 - "$APP/Info.plist" <<'PY'
+          import os, plistlib, sys
+          p = plistlib.load(open(sys.argv[1], "rb"))
+          assert p["CFBundleIdentifier"] == os.environ["APP_BUNDLE_ID"], p["CFBundleIdentifier"]
+          print("Verified", p["CFBundleIdentifier"], p["CFBundleDisplayName"], p["CFBundleShortVersionString"], p["CFBundleVersion"])
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"build={p['CFBundleVersion']}\n")
+          PY
+      - name: Upload to App Store Connect
+        run: |
+          set -euo pipefail
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/build/MaoZhen.xcarchive" \
+            -exportPath "$RUNNER_TEMP/build/export" -exportOptionsPlist "$RUNNER_TEMP/asc-signing/ExportOptions.plist" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc-signing/AuthKey.p8" \
+            -authenticationKeyID "$APPLE_ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$APPLE_ASC_ISSUER_ID" 2>&1 | tee "$RUNNER_TEMP/build/upload.log"
+          echo "Uploaded build ${{ steps.archive.outputs.build }}. TestFlight processing still needs to finish." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: MaoZhen-ios-logs
+          path: ${{ runner.temp }}/build/*.log
+          retention-days: 14
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/asc-signing/build.keychain-db" || true
+          if [[ -n "${PROFILE_UUID:-}" ]]; then rm -f "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/$PROFILE_UUID.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"; fi
+          if [[ -x "$RUNNER_TEMP/asc-venv/bin/python" && -f "$RUNNER_TEMP/asc-signing/AuthKey.p8" ]]; then "$RUNNER_TEMP/asc-venv/bin/python" Scripts/asc_signing.py cleanup || true; fi
+          rm -rf "$RUNNER_TEMP/asc-signing"
+
+  testflight:
+    needs: upload
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: Scripts
+      - name: Prepare the API key
+        env:
+          ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+        run: *write-key
+      - name: Wait for the build and give it to internal testers
+        run: '"$RUNNER_TEMP/asc-venv/bin/python" Scripts/asc_app.py testflight "${{ needs.upload.outputs.build }}"'
+      - name: Remove the key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc-signing"

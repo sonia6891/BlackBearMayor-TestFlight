@@ -27,3 +27,8 @@ Bundle ID：`tw.blackbearmayor.game`。Workflow 的 `action=register` 會註冊 
 
 同一套流程也上傳《九命夢境》：`.github/workflows/ninelives-testflight.yml`，共用上面四個 Secrets（同一個 Apple 開發者團隊和 API 金鑰、同一個加密密碼）。
 遊戲端是九命夢境專案的 `Tools/Publish-TestFlight.ps1`，release 的標籤是 `nld-ios-<build>`。Bundle ID：`tw.ninelivesdream.game`。
+
+## 貓鎮
+
+《貓鎮》是網頁遊戲，用 `.github/workflows/maozhen-testflight.yml` 上傳，共用上面四個 Secrets。
+遊戲端是貓鎮專案的 `ios/Tools/Publish-TestFlight.ps1`：把網頁遊戲包進一個小的 iOS 專案（全螢幕 WKWebView，`project.yml` 由雲端 Mac 用 xcodegen 產生 Xcode 專案），加密後附加到 release，標籤是 `mz-ios-<build>`。Bundle ID：`tw.maozhen.game`。
